@@ -190,7 +190,7 @@ export default function Home() {
         <header className="mb-8">
           <h1 className="text-3xl font-semibold tracking-tight text-center">Trich Tracker</h1>
           <div className="mt-2 text-center text-xs text-white/50">
-            {isoToMDY(today)} (Pacific day)
+            {isoToMDY(today)}
           </div>
         </header>
 
