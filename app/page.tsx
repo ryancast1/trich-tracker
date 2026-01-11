@@ -1,23 +1,21 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { supabase } from "@/lib/supabaseClient";
 
-const START_DATE = "2026-01-10"; // first day you used it
+const START_DATE = "2026-01-10";
+const PACIFIC_TZ = "America/Los_Angeles";
 
-function todayISODate() {
-  const d = new Date();
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd}`;
-}
+type DailyRow = { date: string; t1: number; t2: number };
 
-function isoFromLocalDate(d: Date) {
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd}`;
+function pacificISODate(d = new Date()) {
+  // en-CA => YYYY-MM-DD
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: PACIFIC_TZ,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(d);
 }
 
 function isoToMDY(iso: string) {
@@ -25,20 +23,32 @@ function isoToMDY(iso: string) {
   return `${Number(m)}/${Number(d)}/${y}`;
 }
 
-type DailyRow = { date: string; t1: number; t2: number };
+function dateFromISO(iso: string) {
+  // Noon UTC avoids DST edge weirdness while still mapping cleanly to the intended date label
+  return new Date(`${iso}T12:00:00Z`);
+}
 
 export default function Home() {
   const [userId, setUserId] = useState<string | null>(null);
   const [status, setStatus] = useState<"loading" | "idle" | "saving" | "error">("loading");
   const [err, setErr] = useState<string | null>(null);
 
+  const [today, setToday] = useState(() => pacificISODate());
+
   const [t1, setT1] = useState(0);
   const [t2, setT2] = useState(0);
-
   const [dailyRows, setDailyRows] = useState<DailyRow[]>([]);
 
-  const today = useMemo(() => todayISODate(), []);
+  // Keep "today" updated (Pacific midnight boundary)
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      const t = pacificISODate();
+      setToday((prev) => (prev === t ? prev : t));
+    }, 30_000);
+    return () => window.clearInterval(id);
+  }, []);
 
+  // Get user once
   useEffect(() => {
     (async () => {
       setErr(null);
@@ -60,15 +70,18 @@ export default function Home() {
         return;
       }
 
-      await loadDailyAndToday(id);
       setStatus("idle");
     })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Load data whenever user or "today" changes (so it flips after Pacific midnight)
+  useEffect(() => {
+    if (!userId) return;
+    loadDailyAndToday(userId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userId, today]);
+
   async function fetchAllEventsSince(uid: string) {
-    // Pull only what we need and aggregate client-side.
-    // Uses pagination so it won’t silently cap at 1k/10k.
     const pageSize = 1000;
     let from = 0;
 
@@ -91,8 +104,7 @@ export default function Home() {
       if (rows.length < pageSize) break;
       from += pageSize;
 
-      // safety valve (you can remove later if you want)
-      if (from > 50000) break;
+      if (from > 50000) break; // safety valve
     }
 
     return all;
@@ -105,7 +117,7 @@ export default function Home() {
     try {
       const events = await fetchAllEventsSince(uid);
 
-      // Aggregate per day
+      // Aggregate by occurred_on (Pacific-day bucket)
       const byDay = new Map<string, { t1: number; t2: number }>();
       for (const e of events) {
         const day = e.occurred_on;
@@ -115,20 +127,19 @@ export default function Home() {
         byDay.set(day, cur);
       }
 
-      // Build continuous date list from today back to START_DATE (include 0s)
+      // Build continuous daily rows from Pacific "today" back to START_DATE
       const out: DailyRow[] = [];
-      const start = new Date(`${START_DATE}T00:00:00`);
-      const cur = new Date(`${today}T00:00:00`);
+      const start = dateFromISO(START_DATE);
+      let d = dateFromISO(today);
 
-      for (let d = cur; d >= start; d = new Date(d.getTime() - 86400000)) {
-        const iso = isoFromLocalDate(d);
+      for (; d >= start; d = new Date(d.getTime() - 86400000)) {
+        const iso = pacificISODate(d); // label each row in Pacific
         const agg = byDay.get(iso) ?? { t1: 0, t2: 0 };
         out.push({ date: iso, t1: agg.t1, t2: agg.t2 });
       }
 
       setDailyRows(out);
 
-      // Set button totals from today row
       const todayAgg = byDay.get(today) ?? { t1: 0, t2: 0 };
       setT1(todayAgg.t1);
       setT2(todayAgg.t2);
@@ -146,25 +157,30 @@ export default function Home() {
     setErr(null);
     setStatus("saving");
 
-    // optimistic button totals
-    if (n === 1) setT1((x) => x + 1);
-    if (n === 2) setT2((x) => x + 1);
+    const occurredOn = pacificISODate(); // compute at tap time (Pacific day boundary)
+
+    // optimistic bump only if it’s for the currently displayed "today"
+    if (occurredOn === today) {
+      if (n === 1) setT1((x) => x + 1);
+      if (n === 2) setT2((x) => x + 1);
+    }
 
     const { error } = await supabase.from("trich_events").insert({
       user_id: userId,
       trich: n,
-      occurred_on: today,
+      occurred_on: occurredOn,
     });
 
     if (error) {
-      if (n === 1) setT1((x) => Math.max(0, x - 1));
-      if (n === 2) setT2((x) => Math.max(0, x - 1));
+      if (occurredOn === today) {
+        if (n === 1) setT1((x) => Math.max(0, x - 1));
+        if (n === 2) setT2((x) => Math.max(0, x - 1));
+      }
       setErr(error.message);
       setStatus("error");
       return;
     }
 
-    // refresh daily table + today totals
     await loadDailyAndToday(userId);
   }
 
@@ -173,7 +189,9 @@ export default function Home() {
       <div className="mx-auto w-full max-w-md">
         <header className="mb-8">
           <h1 className="text-3xl font-semibold tracking-tight text-center">Trich Tracker</h1>
-          <div className="mt-2 text-center text-xs text-white/50">{isoToMDY(today)}</div>
+          <div className="mt-2 text-center text-xs text-white/50">
+            {isoToMDY(today)} (Pacific day)
+          </div>
         </header>
 
         <section className="rounded-2xl border border-white/10 bg-white/5 p-4">
@@ -203,7 +221,6 @@ export default function Home() {
           </div>
         </section>
 
-        {/* Daily totals table */}
         <section className="mt-6 rounded-2xl border border-white/10 bg-white/5 p-4">
           <div className="mb-3 text-center text-xs text-white/60">Daily totals</div>
 
