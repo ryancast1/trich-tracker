@@ -38,6 +38,8 @@ export default function Home() {
   const [t1, setT1] = useState(0);
   const [t2, setT2] = useState(0);
   const [dailyRows, setDailyRows] = useState<DailyRow[]>([]);
+  const [exporting, setExporting] = useState(false);
+  const [exportErr, setExportErr] = useState<string | null>(null);
 
   // Keep "today" updated (Pacific midnight boundary)
   useEffect(() => {
@@ -151,6 +153,134 @@ export default function Home() {
     }
   }
 
+  function csvEscape(v: unknown) {
+    const s = v == null ? "" : String(v);
+    // Quote if it contains comma, quote, or newline
+    if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+    return s;
+  }
+
+  function downloadTextFile(filename: string, text: string, mime = "text/csv;charset=utf-8") {
+    const blob = new Blob([text], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  async function fetchEventsForExport(uid: string) {
+    // Try to include a timestamp column. Fall back if the project used a different name.
+    const timestampCandidates = ["created_at", "submitted_at", "inserted_at", "timestamp", "ts"];
+
+    // Page through results to avoid row limits.
+    const pageSize = 1000;
+    let from = 0;
+
+    // We'll pick the first timestamp column that works.
+    let tsCol: string | null = null;
+
+    // Helper that runs one page query with a chosen timestamp column
+    async function runPage(sel: string) {
+      const q = supabase
+        .from("trich_events")
+        .select(sel)
+        .eq("user_id", uid)
+        .gte("occurred_on", START_DATE);
+
+      // Order by timestamp if available, otherwise by occurred_on.
+      const ordered = tsCol ? q.order(tsCol, { ascending: true }) : q.order("occurred_on", { ascending: true });
+      return ordered.range(from, from + pageSize - 1);
+    }
+
+    // First, detect which timestamp column exists (if any)
+    for (const c of timestampCandidates) {
+      const { error } = await supabase
+        .from("trich_events")
+        .select(`occurred_on,trich,${c}`)
+        .eq("user_id", uid)
+        .gte("occurred_on", START_DATE)
+        .order("occurred_on", { ascending: false })
+        .range(0, 0);
+
+      if (!error) {
+        tsCol = c;
+        break;
+      }
+
+      // If the error is NOT about a missing column, stop trying and just proceed without ts.
+      const msg = (error as any)?.message ?? "";
+      if (msg && !msg.toLowerCase().includes("does not exist")) break;
+    }
+
+    const all: Array<{ occurred_on: string; trich: number; ts?: string | null }> = [];
+
+    while (true) {
+      const sel = tsCol ? `occurred_on,trich,${tsCol}` : "occurred_on,trich";
+      const { data, error } = await runPage(sel);
+      if (error) throw error;
+
+      const rows = (data ?? []) as any[];
+      for (const r of rows) {
+        all.push({
+          occurred_on: r.occurred_on,
+          trich: Number(r.trich),
+          ts: tsCol ? (r[tsCol] ?? null) : null,
+        });
+      }
+
+      if (rows.length < pageSize) break;
+      from += pageSize;
+      if (from > 50000) break; // safety valve
+    }
+
+    return { rows: all, tsCol };
+  }
+
+  async function exportCsv() {
+    if (!userId) return;
+
+    setExportErr(null);
+    setExporting(true);
+
+    try {
+      const { rows, tsCol } = await fetchEventsForExport(userId);
+
+      // Header
+      const header = [
+        "occurred_on",
+        "trich",
+        "timestamp",
+      ];
+
+      const lines: string[] = [];
+      lines.push(header.join(","));
+
+      for (const r of rows) {
+        const timestamp = r.ts ?? "";
+        lines.push([
+          csvEscape(r.occurred_on),
+          csvEscape(r.trich),
+          csvEscape(timestamp),
+        ].join(","));
+      }
+
+      // Helpful comment at top if we couldn't find a timestamp column
+      const csvBody = lines.join("\n");
+      const prefix = tsCol ? "" : "# NOTE: No timestamp column found on trich_events; exported occurred_on + trich only.\n";
+
+      const filename = `trich-events-${today}.csv`;
+      downloadTextFile(filename, prefix + csvBody);
+    } catch (e: any) {
+      setExportErr(e?.message ?? "Export failed.");
+    } finally {
+      setExporting(false);
+    }
+  }
+
   async function log(n: 1 | 2) {
     if (!userId) return;
 
@@ -244,6 +374,16 @@ export default function Home() {
               </tbody>
             </table>
           </div>
+
+          <button
+            onClick={exportCsv}
+            disabled={!userId || exporting || status === "loading"}
+            className="mt-3 w-full h-12 rounded-xl border border-white/10 bg-white/5 text-white font-semibold disabled:opacity-60 active:scale-[0.99] transition"
+          >
+            {exporting ? "Exporting…" : "Export CSV"}
+          </button>
+
+          {exportErr && <div className="mt-3 text-center text-sm text-red-300">{exportErr}</div>}
         </section>
       </div>
     </main>
